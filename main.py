@@ -22,7 +22,8 @@ SB = {
 print("Loading cross-encoder model...")
 cross_model = CrossEncoder(
     "cross-encoder/ms-marco-multilingual-MiniLM-L6-v2",
-    max_length=256
+    max_length=256,
+    tokenizer_args={"use_auth_token": os.environ.get("HUGGINGFACE_HUB_TOKEN")}
 )
 print("Cross-encoder loaded.")
 
