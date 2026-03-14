@@ -99,7 +99,7 @@ async def compare_thought(
                 "user_id":      req.user_id,
                 "thought_a_id": req.thought_id,
                 "thought_b_id": existing[i]["id"],
-                "strength":     round(float(score), 4),
+                "similarity_score": round(float(score), 4),
                 "method":       "cross-encoder"
             })
 
@@ -122,6 +122,146 @@ async def compare_thought(
     }
 
 
+
+@app.post("/backfill")
+async def backfill_synapses(
+    req: ClusterRequest,
+    x_api_key: str = Header(None)
+):
+    """
+    Voegt cross-encoder synapses toe voor alle thoughts.
+    Verwijdert NIETS — cosine synapses blijven staan.
+    Roep /cleanup aan als backfill klaar is.
+    """
+    if x_api_key != API_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 1. Haal alle thoughts op
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/thoughts",
+            headers=SB,
+            params={
+                "user_id": f"eq.{req.user_id}",
+                "select":  "id,raw_thought",
+                "limit":   "10000"
+            }
+        )
+        thoughts = r.json()
+
+    if not thoughts:
+        return {"status": "no_thoughts"}
+
+    total_synapses = 0
+
+    # 2. Voor elke thought: vergelijk met alle voorgaande thoughts
+    for i, thought in enumerate(thoughts):
+        if i == 0:
+            continue
+
+        existing = thoughts[:i]
+
+        pairs = [
+            [thought["raw_thought"], t["raw_thought"]]
+            for t in existing
+        ]
+
+        scores = cross_model.predict(
+            pairs,
+            batch_size=64,
+            show_progress_bar=False
+        )
+
+        scores_norm = torch.sigmoid(
+            torch.tensor(scores)
+        ).numpy().tolist()
+
+        synapses = []
+        for j, score in enumerate(scores_norm):
+            if score >= 0.5:
+                synapses.append({
+                    "user_id":          req.user_id,
+                    "thought_a_id":     thought["id"],
+                    "thought_b_id":     existing[j]["id"],
+                    "similarity_score": round(float(score), 4),
+                    "method":           "cross-encoder"
+                })
+
+        if synapses:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await client.post(
+                    f"{SUPABASE_URL}/rest/v1/synapses",
+                    headers={**SB, "Prefer": "resolution=ignore-duplicates"},
+                    json=synapses
+                )
+            total_synapses += len(synapses)
+
+        print(f"Backfill: {i+1}/{len(thoughts)} thoughts, {total_synapses} synapses")
+
+    return {
+        "status":           "ok",
+        "thoughts":         len(thoughts),
+        "synapses_created": total_synapses
+    }
+
+
+@app.post("/cleanup")
+async def cleanup_cosine_synapses(
+    req: ClusterRequest,
+    x_api_key: str = Header(None)
+):
+    """
+    Verwijdert alle cosine synapses (method = 'cosine' of NULL).
+    Alleen aanroepen nadat /backfill volledig klaar is.
+    """
+    if x_api_key != API_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Check hoeveel cross-encoder synapses er zijn
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/synapses",
+            headers=SB,
+            params={
+                "user_id": f"eq.{req.user_id}",
+                "method":  "eq.cross-encoder",
+                "select":  "id",
+                "limit":   "1"
+            }
+        )
+        ce_check = r.json()
+
+    if not ce_check:
+        return {
+            "status": "aborted",
+            "reason": "Geen cross-encoder synapses gevonden. Draai eerst /backfill."
+        }
+
+    # Verwijder cosine synapses
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        await client.delete(
+            f"{SUPABASE_URL}/rest/v1/synapses",
+            headers=SB,
+            params={
+                "user_id": f"eq.{req.user_id}",
+                "method":  "eq.cosine"
+            }
+        )
+        # Verwijder ook synapses zonder method (legacy)
+        await client.delete(
+            f"{SUPABASE_URL}/rest/v1/synapses",
+            headers=SB,
+            params={
+                "user_id": f"eq.{req.user_id}",
+                "method":  "is.null"
+            }
+        )
+
+    return {
+        "status": "ok",
+        "message": "Cosine synapses verwijderd. Draai nu /cluster."
+    }
+
 @app.post("/cluster")
 async def run_clustering(
     req: ClusterRequest,
@@ -138,7 +278,7 @@ async def run_clustering(
             headers=SB,
             params={
                 "user_id": f"eq.{req.user_id}",
-                "select":  "thought_a_id,thought_b_id,strength,method",
+                "select":  "thought_a_id,thought_b_id,similarity_score,method",
                 "limit":   "500000"
             }
         )
@@ -172,7 +312,7 @@ async def run_clustering(
         b = id_idx.get(s["thought_b_id"])
         if a is not None and b is not None:
             edges.append((a, b))
-            weights.append(float(s["strength"]))
+            weights.append(float(s["similarity_score"]))
 
     g.add_edges(edges)
     if weights:
