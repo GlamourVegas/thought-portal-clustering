@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from collections import defaultdict
 from datetime import datetime, timezone
 import os, math, igraph as ig, leidenalg, httpx
+import torch
+from sentence_transformers import CrossEncoder
 
 app = FastAPI()
 
@@ -16,12 +18,103 @@ SB = {
     "Content-Type": "application/json"
 }
 
+# Cross-encoder model — laadt één keer bij server start (~10s)
+print("Loading cross-encoder model...")
+cross_model = CrossEncoder(
+    "cross-encoder/ms-marco-multilingual-MiniLM-L6-v2",
+    max_length=256
+)
+print("Cross-encoder loaded.")
+
+
 class ClusterRequest(BaseModel):
     user_id: str
+
+class CompareRequest(BaseModel):
+    user_id: str
+    thought_id: str
+    thought_text: str
+    threshold: float = 0.5
+
 
 @app.get("/health")
 def health():
     return {"status": "alive", "service": "thought-portal-clustering"}
+
+
+@app.post("/compare")
+async def compare_thought(
+    req: CompareRequest,
+    x_api_key: str = Header(None)
+):
+    if x_api_key != API_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 1. Haal alle bestaande thoughts op voor deze user
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/thoughts",
+            headers=SB,
+            params={
+                "user_id": f"eq.{req.user_id}",
+                "id":      f"neq.{req.thought_id}",
+                "select":  "id,raw_thought",
+                "limit":   "2000"
+            }
+        )
+        existing = r.json()
+
+    if not existing:
+        return {"status": "ok", "synapses_created": 0, "message": "No existing thoughts to compare"}
+
+    # 2. Bouw paren voor cross-encoder
+    pairs = [
+        [req.thought_text, t["raw_thought"]]
+        for t in existing
+    ]
+
+    # 3. Batch scoring
+    scores = cross_model.predict(
+        pairs,
+        batch_size=64,
+        show_progress_bar=False
+    )
+
+    # 4. Normaliseer scores naar 0-1 via sigmoid
+    scores_norm = torch.sigmoid(
+        torch.tensor(scores)
+    ).numpy().tolist()
+
+    # 5. Filter op threshold en bouw synapses
+    synapses = []
+    for i, score in enumerate(scores_norm):
+        if score >= req.threshold:
+            synapses.append({
+                "user_id":      req.user_id,
+                "thought_a_id": req.thought_id,
+                "thought_b_id": existing[i]["id"],
+                "strength":     round(float(score), 4),
+                "method":       "cross-encoder"
+            })
+
+    # 6. Batch INSERT naar Supabase
+    if synapses:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/synapses",
+                headers={**SB, "Prefer": "resolution=ignore-duplicates"},
+                json=synapses
+            )
+
+    return {
+        "status":           "ok",
+        "compared":         len(existing),
+        "synapses_created": len(synapses),
+        "avg_score":        round(sum(scores_norm) / len(scores_norm), 4),
+        "max_score":        round(max(scores_norm), 4),
+        "threshold":        req.threshold
+    }
+
 
 @app.post("/cluster")
 async def run_clustering(
@@ -39,8 +132,8 @@ async def run_clustering(
             headers=SB,
             params={
                 "user_id": f"eq.{req.user_id}",
-                "select": "thought_a_id,thought_b_id,strength",
-                "limit": "500000"
+                "select":  "thought_a_id,thought_b_id,strength",
+                "limit":   "500000"
             }
         )
         synapses = r1.json()
@@ -51,8 +144,8 @@ async def run_clustering(
             headers=SB,
             params={
                 "user_id": f"eq.{req.user_id}",
-                "select": "id,valence_score,activation_score,agency_score,created_at",
-                "limit": "500000"
+                "select":  "id,valence_score,activation_score,agency_score,created_at",
+                "limit":   "500000"
             }
         )
         thoughts = r2.json()
