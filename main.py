@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 import os, math, igraph as ig, leidenalg, httpx
 import torch
+from huggingface_hub import login
 from sentence_transformers import CrossEncoder
 
 app = FastAPI()
@@ -18,12 +19,16 @@ SB = {
     "Content-Type": "application/json"
 }
 
+# Hugging Face authenticatie
+hf_token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+if hf_token:
+    login(token=hf_token)
+
 # Cross-encoder model — laadt één keer bij server start (~10s)
 print("Loading cross-encoder model...")
 cross_model = CrossEncoder(
     "cross-encoder/ms-marco-multilingual-MiniLM-L6-v2",
-    max_length=256,
-    tokenizer_args={"use_auth_token": os.environ.get("HUGGINGFACE_HUB_TOKEN")}
+    max_length=256
 )
 print("Cross-encoder loaded.")
 
