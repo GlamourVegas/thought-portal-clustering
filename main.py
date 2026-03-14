@@ -138,7 +138,7 @@ async def run_clustering(
             headers=SB,
             params={
                 "user_id": f"eq.{req.user_id}",
-                "select":  "thought_a_id,thought_b_id,strength",
+                "select":  "thought_a_id,thought_b_id,strength,method",
                 "limit":   "500000"
             }
         )
