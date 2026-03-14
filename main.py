@@ -27,7 +27,7 @@ if hf_token:
 # Cross-encoder model — laadt één keer bij server start (~10s)
 print("Loading cross-encoder model...")
 cross_model = CrossEncoder(
-    "cross-encoder/ms-marco-multilingual-MiniLM-L6-v2",
+    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     max_length=256
 )
 print("Cross-encoder loaded.")
